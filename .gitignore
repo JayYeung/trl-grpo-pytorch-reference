@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+grpo_cpu_env/
+venv/
+env/
+ENV/
+
+# Model outputs and checkpoints
+qwen-grpo-cpu-output/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs and metrics
+*.log
+*.csv
+wandb/
+runs/
+
+# Hugging Face cache
+.cache/
+huggingface/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+tmp/
+temp/
+*.tmp
