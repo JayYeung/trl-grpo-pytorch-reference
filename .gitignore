@@ -10,12 +10,14 @@ build/
 
 # Virtual Environment
 grpo_cpu_env/
+grpo_gpu_env/
 venv/
 env/
 ENV/
 
 # Model outputs and checkpoints
 qwen-grpo-cpu-output/
+qwen-grpo-gpu-output/
 *.pt
 *.pth
 *.bin

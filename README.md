@@ -1,21 +1,23 @@
-# CPU-based GRPO Reference Implementation
+# GRPO Reference Implementation (CPU & GPU)
 
-A reference implementation of Group Relative Policy Optimization (GRPO) that runs on CPU using PyTorch and Hugging Face TRL. This provides a local reference for debugging and understanding the GRPO algorithm before deploying to AWS Neuron instances.
+A reference implementation of Group Relative Policy Optimization (GRPO) using PyTorch and Hugging Face TRL. This provides implementations for both CPU and GPU training for debugging and understanding the GRPO algorithm before deploying to AWS Neuron instances.
 
 Based on: [optimum-neuron-grpo](https://github.com/alex1xu/optimum-neuron-grpo/tree/alex-save-wip4)
 
 ## Overview
 
-This implementation mirrors the structure of the Neuron-based GRPO trainer but runs entirely on CPU with vanilla PyTorch. It's designed for:
+This implementation mirrors the structure of the Neuron-based GRPO trainer but runs with vanilla PyTorch. It's designed for:
 
 -   🔍 **Understanding GRPO**: Step through the algorithm locally
 -   🐛 **Debugging**: Test changes without expensive cloud resources
 -   📚 **Learning**: Reference implementation with detailed comments
 -   🧪 **Experimentation**: Quick iteration on small datasets
+-   🚀 **GPU Training**: Production-ready GPU implementation with bfloat16
 
 ## What's Included
 
--   `cpu_grpo_qwen3_0_6b.py` - Main training script using Qwen 0.5B/0.6B
+-   `gpu_grpo_qwen3_0_6b.py` - **GPU training script** (recommended for production)
+-   `cpu_grpo_qwen3_0_6b.py` - CPU-only training script (for debugging)
 -   `requirements.txt` - Python dependencies
 -   `setup_env.sh` - Automated environment setup
 -   `README.md` - This file
@@ -45,6 +47,21 @@ source grpo_cpu_env/bin/activate
 
 ### 3. Run Training
 
+#### GPU Training (Recommended)
+
+```bash
+python gpu_grpo_qwen3_0_6b.py
+```
+
+**Features:**
+- ✅ Full CUDA GPU support with automatic multi-GPU distribution
+- ✅ bfloat16 precision for faster training
+- ✅ Gradient checkpointing for memory efficiency
+- ✅ Larger batch sizes and more samples
+- ✅ Production-ready configuration
+
+#### CPU Training (Debug Only)
+
 ```bash
 python cpu_grpo_qwen3_0_6b.py
 ```
@@ -53,35 +70,52 @@ python cpu_grpo_qwen3_0_6b.py
 
 ## Configuration
 
-The `Config` class in `cpu_grpo_qwen3_0_6b.py` contains all hyperparameters:
+### GPU Configuration (`gpu_grpo_qwen3_0_6b.py`)
 
 ```python
 @dataclass
 class Config:
-    model_name: str = "Qwen/Qwen2.5-0.5B"  # Model to train
-    max_samples: int = 100                  # Limit for CPU testing
+    model_name: str = "Qwen/Qwen2.5-0.5B"
+    max_samples: int = 100                   # GPU can handle more
     max_prompt_length: int = 256
     max_completion_length: int = 128
-    per_device_train_batch_size: int = 1
-    num_generations: int = 4                # Group size (G)
-    kl_coeff: float = 0.01                  # KL penalty
+    per_device_train_batch_size: int = 4    # Larger batches on GPU
+    gradient_accumulation_steps: int = 2     # Effective batch: 8
+    num_generations: int = 4                 # Group size (G)
+    beta: float = 0.01                       # KL penalty
     learning_rate: float = 5e-6
-    # ... and more
+    # bf16=True, gradient_checkpointing=True
+```
+
+### CPU Configuration (`cpu_grpo_qwen3_0_6b.py`)
+
+```python
+@dataclass
+class Config:
+    model_name: str = "Qwen/Qwen2.5-0.5B"
+    max_samples: int = 10                    # Fewer for CPU
+    max_prompt_length: int = 128
+    max_completion_length: int = 64
+    per_device_train_batch_size: int = 1    # Minimal on CPU
+    num_generations: int = 2                # Reduced for speed
+    beta: float = 0.01
+    learning_rate: float = 5e-6
+    # bf16=False (CPU uses fp32)
 ```
 
 Edit these values to experiment with different settings.
 
 ## How It Maps to Neuron Implementation
 
-| Neuron (optimum-neuron)  | CPU Reference (TRL)          |
-| ------------------------ | ---------------------------- |
-| `NeuronGRPOConfig`       | `GRPOConfig`                 |
-| `NeuronGRPOTrainer`      | `GRPOTrainer`                |
-| `NeuronModelForCausalLM` | `AutoModelForCausalLM`       |
-| `tensor_parallel_size`   | N/A (not needed on CPU)      |
-| `bf16=True`              | `bf16=False` (CPU uses fp32) |
+| Neuron (optimum-neuron)  | GPU Reference (TRL)          | CPU Reference (TRL)          |
+| ------------------------ | ---------------------------- | ---------------------------- |
+| `NeuronGRPOConfig`       | `GRPOConfig`                 | `GRPOConfig`                 |
+| `NeuronGRPOTrainer`      | `GRPOTrainer`                | `GRPOTrainer`                |
+| `NeuronModelForCausalLM` | `AutoModelForCausalLM`       | `AutoModelForCausalLM`       |
+| `tensor_parallel_size`   | `device_map="auto"`          | N/A                          |
+| `bf16=True`              | `bf16=True` (GPU)            | `bf16=False` (CPU uses fp32) |
 
-The training loop, reward function, and dataset preparation are structurally identical.
+The training loop, reward function, and dataset preparation are structurally identical across all implementations.
 
 ## Dataset: GSM8K
 
