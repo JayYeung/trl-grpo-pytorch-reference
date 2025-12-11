@@ -31,11 +31,12 @@ class Config:
     model_name: str = "Qwen/Qwen2.5-0.5B"  # Using Qwen2.5-0.5B as closest to 0.6B
     
     # Dataset settings
-    max_samples: int = 1000  # Number of training samples for repeat task
+    dataset_type: str = "gsm8k"  # Options: "repeat" or "gsm8k"
+    max_samples: int = 1000  # Number of training samples
     
     # Token length limits
-    max_prompt_length: int = 256
-    max_completion_length: int = 128
+    max_prompt_length: int = 512
+    max_completion_length: int = 512
     
     # Training hyperparameters
     per_device_train_batch_size: int = 4  # Increased for GPU
@@ -48,7 +49,7 @@ class Config:
     beta: float = 0.01              # KL divergence coefficient (called 'beta' in TRL)
     
     # Output and logging
-    output_dir: str = "qwen-grpo-gpu-output"
+    output_dir: str = "qwen-grpo-gpu-output-gsm8k"
     logging_steps: int = 1
     save_steps: int = 100
     seed: int = 42
@@ -132,29 +133,70 @@ def load_repeat_dataset(
     return dataset
 
 
+def load_gsm8k_dataset(
+    split: str = "train",
+    max_samples: int = None,
+) -> Dataset:
+    """
+    Load GSM8K math reasoning dataset for GRPO training.
+    
+    This dataset tests the model's ability to solve grade school math problems.
+    """
+    print(f"Loading GSM8K dataset (split: {split})...")
+    
+    # Load the dataset from HuggingFace
+    dataset = load_dataset("openai/gsm8k", "main", split=split)
+    
+    # Limit samples if requested
+    if max_samples is not None and max_samples < len(dataset):
+        dataset = dataset.select(range(max_samples))
+        print(f"Limited to {max_samples} samples")
+    
+    # Format the dataset for GRPO with instructions
+    def format_prompt(example):
+        # Add instruction to encourage proper formatting
+        prompt = f"{example['question']}\nLet's solve this step by step, then provide the final answer."
+        return {
+            "prompt": prompt,
+            "ground_truth": example["answer"]
+        }
+    
+    dataset = dataset.map(format_prompt, remove_columns=dataset.column_names)
+    
+    print(f"Loaded {len(dataset)} GSM8K examples")
+    return dataset
+
+
 # -----------------------------------------------------------------------------
 # 3. Reward function - Extract and verify answers
 # -----------------------------------------------------------------------------
 
 def extract_answer(text: str) -> str:
     """
-    Extract numeric answer from text - searches anywhere in the text.
+    Extract numeric answer from text with multiple strategies.
     
-    Matches the Neuron implementation's logic:
-    1. First try to find answer after #### marker (GSM8K format)
-    2. If no #### marker, just find any number in the text
+    Tries in order:
+    1. Answer after #### marker (GSM8K ground truth format)
+    2. "The answer is: X" pattern (common model output)
+    3. "#### X" pattern
+    4. Last number in the text (fallback)
     """
-    # First try to find answer after #### marker (GSM8K format)
+    # Strategy 1: GSM8K format with #### marker
     match = re.search(r"####\s*([^\n]+)", text)
     if match:
         num_match = re.search(r"[\d,]+(?:\.\d+)?", match.group(1).strip())
         if num_match:
             return num_match.group(0).replace(",", "")
     
-    # If no #### marker, just find any number in the text
-    num_match = re.search(r"[\d,]+(?:\.\d+)?", text)
-    if num_match:
-        return num_match.group(0).replace(",", "")
+    # Strategy 2: "The answer is: X" or "answer is X" pattern
+    match = re.search(r"(?:the\s+)?answer\s+is:?\s*([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).replace(",", "")
+    
+    # Strategy 3: Last number in text (common for model outputs)
+    numbers = re.findall(r"[\d,]+(?:\.\d+)?", text)
+    if numbers:
+        return numbers[-1].replace(",", "")
     
     return ""
 
@@ -166,11 +208,14 @@ def extract_all_numbers(text: str) -> list[str]:
 
 def create_reward_function(dataset):
     """
-    Create reward function that checks if generated answer matches ground truth.
+    Create improved reward function for GSM8K that encourages proper formatting.
     
-    This matches the Neuron implementation's reward logic:
-    - Compares extracted numbers from completions against ground truth answers
-    - Returns 1.0 for correct answers, 0.0 otherwise
+    Reward structure:
+    - 1.0: Correct answer with proper formatting ("The answer is: X" or "#### X")
+    - 0.7: Correct answer as last number in completion
+    - 0.3: Correct answer appears anywhere in completion
+    - 0.1: Completion is non-empty and attempts reasoning
+    - 0.0: Wrong answer or empty completion
     
     Args:
         dataset: Dataset with 'prompt' and 'ground_truth' columns
@@ -187,7 +232,7 @@ def create_reward_function(dataset):
     
     def reward_fn(prompts: List[str], completions: List[str], **kwargs) -> List[float]:
         """
-        Reward function for GRPO training.
+        Reward function for GRPO training with partial credit.
         
         Args:
             prompts: List of prompt strings
@@ -195,7 +240,7 @@ def create_reward_function(dataset):
             **kwargs: Additional arguments passed by TRL
             
         Returns:
-            List of reward scores (1.0 for correct, 0.0 for incorrect)
+            List of reward scores (0.0 to 1.0)
         """
         rewards = []
         
@@ -203,8 +248,7 @@ def create_reward_function(dataset):
             # Get ground truth for this prompt
             gt = answer_cache.get(prompt)
             
-            if not gt:
-                # No ground truth available
+            if not gt or not completion.strip():
                 rewards.append(0.0)
                 continue
             
@@ -212,18 +256,52 @@ def create_reward_function(dataset):
             gt_ans = extract_answer(gt)
             
             if not gt_ans:
-                # Could not extract answer from ground truth
                 rewards.append(0.0)
                 continue
             
-            # Extract all numbers from completion
-            all_numbers = extract_all_numbers(completion)
+            # Normalize answers for comparison (remove decimals if .0)
+            try:
+                gt_num = float(gt_ans)
+                gt_ans_normalized = str(int(gt_num)) if gt_num == int(gt_num) else gt_ans
+            except ValueError:
+                gt_ans_normalized = gt_ans
             
-            # Check if the correct answer appears anywhere in the completion
-            if gt_ans in all_numbers:
-                rewards.append(1.0)  # Correct!
+            # Extract answer from completion
+            completion_ans = extract_answer(completion)
+            
+            # Normalize completion answer
+            try:
+                comp_num = float(completion_ans) if completion_ans else None
+                comp_ans_normalized = str(int(comp_num)) if comp_num and comp_num == int(comp_num) else completion_ans
+            except ValueError:
+                comp_ans_normalized = completion_ans
+            
+            # Check if answer is correct
+            is_correct = (gt_ans_normalized == comp_ans_normalized or gt_ans == completion_ans)
+            
+            if is_correct:
+                # Check for proper formatting - highest reward
+                if re.search(r"(?:the\s+)?answer\s+is:?\s*" + re.escape(completion_ans), completion, re.IGNORECASE):
+                    rewards.append(1.0)  # Perfect: correct with "The answer is: X" format
+                elif "####" in completion:
+                    rewards.append(1.0)  # Perfect: correct with #### format
+                # Check if it's the last number (good practice)
+                elif completion_ans and completion.rstrip().endswith(completion_ans):
+                    rewards.append(0.8)  # Good: answer at the end
+                # Check if answer is in the last 50 characters
+                elif completion_ans in completion[-50:]:
+                    rewards.append(0.7)  # Decent: answer near the end
+                else:
+                    rewards.append(0.5)  # Partial: correct but poorly formatted
             else:
-                rewards.append(0.0)  # Incorrect
+                # Wrong answer - check if there's any reasoning attempt
+                all_numbers = extract_all_numbers(completion)
+                if gt_ans in all_numbers or gt_ans_normalized in [str(n).replace(",", "") for n in all_numbers]:
+                    rewards.append(0.3)  # Partial: has correct number but extracted wrong one
+                elif len(completion.strip()) > 20:  # At least attempting to reason
+                    rewards.append(0.1)  # Small reward for trying
+                else:
+                    rewards.append(0.0)  # No useful output
         
         return rewards
     
@@ -430,8 +508,13 @@ def create_grpo_trainer(model, tokenizer, train_dataset):
     print(f"  Learning rate: {cfg.learning_rate}")
     print(f"  KL coefficient (beta): {cfg.beta}")
     
-    # Create reward function with similarity-based matching (matches Neuron implementation)
-    base_reward_fn = create_exact_match_reward_function(train_dataset)
+    # Select appropriate reward function based on dataset
+    if cfg.dataset_type == "gsm8k":
+        print("\nUsing numeric extraction reward function for GSM8K")
+        base_reward_fn = create_reward_function(train_dataset)
+    else:  # repeat task
+        print("\nUsing similarity-based reward function for repeat task")
+        base_reward_fn = create_exact_match_reward_function(train_dataset)
     
     # Wrap reward function to capture prompts/completions
     captured_data = {'prompts': [], 'completions': [], 'rewards': []}
@@ -493,11 +576,11 @@ def create_grpo_trainer(model, tokenizer, train_dataset):
                     "std_reward": round(reward_std, 4) if reward_std else None,
                     "accuracy": round(sum(1 for r in rewards if r >= 0.9) / len(rewards), 4) if rewards else None,
                     "num_samples": len(rewards) if rewards else None,
-                    "example_prompt_1": str(prompts[0])[:150].replace('\n', ' ') if len(prompts) > 0 else None,
-                    "example_completion_1": str(completions[0])[:150].replace('\n', ' ') if len(completions) > 0 else None,
+                    "example_prompt_1": str(prompts[0])[:].replace('\n', ' ') if len(prompts) > 0 else None,
+                    "example_completion_1": str(completions[0])[:].replace('\n', ' ') if len(completions) > 0 else None,
                     "example_reward_1": round(float(rewards[0]), 4) if len(rewards) > 0 else None,
-                    "example_prompt_2": str(prompts[1])[:150].replace('\n', ' ') if len(prompts) > 1 else None,
-                    "example_completion_2": str(completions[1])[:150].replace('\n', ' ') if len(completions) > 1 else None,
+                    "example_prompt_2": str(prompts[1])[:].replace('\n', ' ') if len(prompts) > 1 else None,
+                    "example_completion_2": str(completions[1])[:].replace('\n', ' ') if len(completions) > 1 else None,
                     "example_reward_2": round(float(rewards[1]), 4) if len(rewards) > 1 else None,
                 }
                 
@@ -556,7 +639,13 @@ def main():
     print("\n" + "-" * 70)
     print("Step 1: Preparing Dataset")
     print("-" * 70)
-    train_dataset = load_repeat_dataset(max_samples=cfg.max_samples)
+    
+    if cfg.dataset_type == "gsm8k":
+        train_dataset = load_gsm8k_dataset(split="train", max_samples=cfg.max_samples)
+    elif cfg.dataset_type == "repeat":
+        train_dataset = load_repeat_dataset(max_samples=cfg.max_samples)
+    else:
+        raise ValueError(f"Unknown dataset_type: {cfg.dataset_type}. Must be 'gsm8k' or 'repeat'")
     
     # Load model and tokenizer
     print("\n" + "-" * 70)
